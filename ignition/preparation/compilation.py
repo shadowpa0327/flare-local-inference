@@ -408,7 +408,7 @@ def _lower_storage(module):
                                     **torch.fx.map_arg(node.kwargs, lambda arg: arg.meta['val']))
                             break
     mutations = {node: _mutated_tensors(node) for node in originals if node.op == 'call_function'}
-    materialize = _reads_across_mutations(originals, keys, mutations)
+    materialize, overwrites = _reads_across_mutations(originals, keys, mutations)
     dtypes, storage_references = {}, {}
     for node, key in keys.items():
         dtypes.setdefault(key, set()).add(node.meta['val'].dtype)
@@ -438,7 +438,7 @@ def _lower_storage(module):
     def key_for(node):
         return keys[node]
 
-    calls = []
+    calls, lowered = [], {}
     for node in originals:
         if node.op != 'call_function':
             continue
@@ -486,7 +486,7 @@ def _lower_storage(module):
         calls.append(invocation)
         with graph.inserting_before(node):
             arguments = (reads, writes, handle, integers) if integers else (reads, writes, handle)
-            graph.call_function(torch.ops.flare.storage_call.default, arguments)
+            lowered[node] = graph.call_function(torch.ops.flare.storage_call.default, arguments)
         if node.users:
             schema = getattr(target, '_schema', None)
             aliases = [] if schema is None else [
@@ -527,6 +527,11 @@ def _lower_storage(module):
             value.meta = node.meta.copy()
         node.replace_all_uses_with(value)
         value.args = (node,)
+        # Read the snapshot in the storage call that overwrites its inputs, so Inductor computes it first
+        # instead of deferring it past that call and cloning the whole overwritten storage to keep it valid.
+        call = lowered.get(overwrites.get(node))
+        if call is not None:
+            call.args = (list(call.args[0]) + [value], *call.args[1:])
     graph.eliminate_dead_code()
     graph.lint()
     return calls
@@ -551,7 +556,7 @@ def _mutated_tensors(node):
 
 
 def _reads_across_mutations(nodes, keys, mutations):
-    """Materialize computed values that outlive an overwrite of their inputs."""
+    """Materialize computed values that outlive an overwrite of their inputs; also return each one's first overwrite."""
     positions = {node: index for index, node in enumerate(nodes)}
     last_use = {node: max((positions[user] for user in node.users), default=-1) for node in nodes}
     # Inductor can inline an expression into a later consumer after its input was overwritten.
@@ -563,7 +568,7 @@ def _reads_across_mutations(nodes, keys, mutations):
     mutations = {node: {keys[operand] for operand in operands}
                  for node, operands in mutations.items() if operands}
     mutable = set().union(*mutations.values()) if mutations else set()
-    live, fresh, required = {}, set(), set()
+    live, fresh, required, overwrites = {}, set(), set(), {}
     for index, node in enumerate(nodes):
         operands = node.all_input_nodes
         reads = set().union(*(live.get(arg, set()) for arg in operands)) if operands else set()
@@ -572,6 +577,7 @@ def _reads_across_mutations(nodes, keys, mutations):
             for previous, pending in live.items():
                 if previous in fresh and last_use[previous] > index and pending & mutations[node]:
                     required.add(previous)
+                    overwrites.setdefault(previous, node)
                     pending.clear()
         live = {value: pending for value, pending in live.items() if pending and last_use[value] > index}
         if (node in keys and node.op == 'call_function'
@@ -581,4 +587,4 @@ def _reads_across_mutations(nodes, keys, mutations):
             live[node] = reads
         elif node in keys and keys[node] in mutable:
             live[node] = {keys[node]}
-    return [node for node in nodes if node in required]
+    return [node for node in nodes if node in required], overwrites
