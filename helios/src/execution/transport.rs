@@ -360,6 +360,7 @@ struct Resources {
     frames: [Frame; 2],
     engram: Option<crate::engram::Transfers>,
     input_copies: InputCopyBatches,
+    zeros: Option<PinnedHost>,
 }
 
 /// Thread-bound executor over one borrowed prepared model and its CUDA context.
@@ -451,6 +452,7 @@ impl GraphExecutor {
                 frames,
                 engram,
                 input_copies: InputCopyBatches::new(upload_capacity.saturating_add(2)),
+                zeros: None,
             }),
             resolved_uploads: Vec::with_capacity(upload_capacity),
             next_sequence: 1,
@@ -645,6 +647,24 @@ impl GraphExecutor {
                 // Descriptor slices are consumed synchronously by the driver.
                 unsafe { resources.model.copy_batch(dst, src, sizes) }
             })?;
+            let released = std::mem::take(&mut *crate::cache::RELEASED_ALIAS_PAGES.lock().unwrap());
+            if let Some(cache) = self.manifest.cache.as_ref().filter(|_| !released.is_empty()) {
+                if resources.zeros.is_none() {
+                    let largest = cache.planes.iter().map(|plane| plane.unit_bytes).max().unwrap_or(0);
+                    resources.zeros = Some(resources.model.host_buffer(largest as usize)?);
+                }
+                let zeros = resources.zeros.as_ref().unwrap();
+                for page in released {
+                    for plane in &cache.planes {
+                        // SAFETY: the page id is below the plane's capacity, the pinned zeros live
+                        // as long as the streams, and the snapshot's last reader retired before release.
+                        unsafe {
+                            resources.model.upload(plane.unit_address(page as u64) as usize, zeros, 0,
+                                                   plane.unit_bytes as usize)?;
+                        }
+                    }
+                }
+            }
             resources.model.record(&frame.started)?;
             if crate::engram::consumes(graph.kind) {
                 if let Some(engram) = &resources.engram {

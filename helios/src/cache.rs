@@ -11,6 +11,12 @@ pub use hash::{ConditioningEvent, HASH_BLOCK_TOKENS, PrefixHistory, PrefixKey};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SnapshotId(pub u32);
 
+/// KV page ids whose bytes last held a snapshot row. The executor zeroes them on the model
+/// stream before its next launch: attention multiplies masked positions of a partial tail page
+/// by zero, so row bytes that decode as NaN in the KV format would poison every later read.
+pub static RELEASED_ALIAS_PAGES: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+
 /// Completion on one ordered timeline covering every relevant GPU stream.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Fence(pub u64);

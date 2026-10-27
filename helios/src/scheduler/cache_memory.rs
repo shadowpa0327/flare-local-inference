@@ -158,6 +158,7 @@ impl RequestScheduler {
                 *count = count.checked_sub(1).expect("snapshot alias ownership");
                 if *count == 0 {
                     self.stats.snapshot_backing_pages -= 1;
+                    crate::cache::RELEASED_ALIAS_PAGES.lock().unwrap().push(page);
                     assert!(self.free_pages.insert(PageId(page)));
                 }
             }
